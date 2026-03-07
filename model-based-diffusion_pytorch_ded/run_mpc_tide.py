@@ -1,233 +1,229 @@
 import torch
 import numpy as np
 import os
+import pandas as pd
+import pickle
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import copy
 
+# 외부 모듈 임포트
+from nn_functions import surrogate
+from moving_average import moving_average_1d
+from GAMMA_obj_temp_depth import GAMMA_obj
+import mbd.envs 
 from mbd.planners.mbd_planner import Args, reverse_once
-import mbd.envs
-import pandas as pd
 
+# ==========================================
+# 1. 노트북 원본 정규화 파라미터 및 함수 (Cell 5, 7 복사)
+# ==========================================
+# 노트북의 실제 값을 그대로 사용합니다.
+x_min = torch.tensor([[0.0, 0.75, 0.75, 504.26]], dtype=torch.float32)
+x_max = torch.tensor([[7.5, 20.0, 20.0, 732.298]], dtype=torch.float32)
+y_min = torch.tensor([[436.608, -0.559]], dtype=torch.float32)
+y_max = torch.tensor([[4509.855, 0.551]], dtype=torch.float32)
 
-# ===============================
-# 1. 물리 모델 (실제 시스템)
-# ===============================
-def f_ss(x0, u):
-    A = np.array([[0.3, 0.1], [0.1, 0.2]])
-    B = np.array([[0.5], [1.0]])
-    mu = np.array([[0], [0]])
-    w = np.array([[0.05], [0.1]])
+def normalize_x(x, dim_id):
+    # dim_id에 해당하는 min/max 값을 가져와서 전체 x에 대해 연산 (차원 에러 방지)
+    xmin = x_min.to(x.device)[0, dim_id]
+    xmax = x_max.to(x.device)[0, dim_id]
+    return 2 * (x - xmin) / (xmax - xmin) - 1
 
-    x_next = A @ x0 + B @ u + np.random.normal(mu, w, size=(2, 1))
-    return x_next
+def inverse_normalize_x(x_norm, dim_id):
+    xmin = x_min.to(x_norm.device)[0, dim_id]
+    xmax = x_max.to(x_norm.device)[0, dim_id]
+    return 0.5 * (x_norm + 1) * (xmax - xmin) + xmin
 
+def normalize_y(y, dim_id):
+    ymin = y_min.to(y.device)[0, dim_id]
+    ymax = y_max.to(y.device)[0, dim_id]
+    return 2 * (y - ymin) / (ymax - ymin) - 1
 
-# ===============================
-# 2. MPC 실행 함수
-# ===============================
-import time
-import os
+def plot_fig(MPC_GAMMA, N_step, save_path=None):
+    plt.figure(figsize=[8, 8])
+    plt.subplot(3, 1, 1)
+    plt.plot(MPC_GAMMA.x_past_save[:N_step, 0].detach().cpu().numpy(), label="GAMMA simulation")
+    plt.plot(MPC_GAMMA.ref[:N_step].detach().cpu().numpy(), 'r--', label="Reference")
+    plt.ylabel("Temp (K)"); plt.legend()
+    plt.subplot(3, 1, 2)
+    plt.plot(MPC_GAMMA.x_past_save[:N_step, 1].detach().cpu().numpy(), label="GAMMA simulation")
+    plt.axhline(y=0.4126, color='k', linestyle='--'); plt.axhline(y=0.1423, color='k', linestyle='--')
+    plt.ylabel("Depth (mm)")
+    plt.subplot(3, 1, 3)
+    plt.plot(MPC_GAMMA.u_past_save[:N_step].detach().cpu().numpy(), color='purple')
+    plt.ylabel("Laser (W)"); plt.xlabel("Step")
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=200); plt.close()
 
+# ==========================================
+# 2. MBD 실행 함수 (노트북 Cell 6 로직 반영)
+# ==========================================
+def run_one_step_diffusion(GAMMA_obj, env, mbd_args, P, window):
+    device = torch.device(mbd_args.device)
 
-def run_mpc(args: Args, tag="default"):
+    # 과거 시퀀스 준비
+    mp_temp_past_t = GAMMA_obj.x_past.T.unsqueeze(0).to(device)  # [1, 50, 2]
+    laser_past_t = GAMMA_obj.u_past.view(1, -1, 1).to(device)     # [1, 50, 1]
+    fix_cov_past = GAMMA_obj.fix_cov_all[GAMMA_obj.MPC_counter - window:GAMMA_obj.MPC_counter, :]
+    fix_cov_past_t = torch.as_tensor(fix_cov_past, dtype=torch.float32, device=device).unsqueeze(0)
 
-    device = torch.device(args.device)
+    # 정규화 (노트북 방식: laser_past_t가 1채널이어도 [3]번 파라미터로 정상 계산됨)
+    fix_cov_past_s = normalize_x(fix_cov_past_t, dim_id=[0, 1, 2])
+    laser_past_s = normalize_x(laser_past_t, dim_id=[3])
+    mp_temp_past_s = normalize_y(mp_temp_past_t, dim_id=[0, 1])
 
-    # ===============================
-    # 결과 저장 폴더 생성
-    # ===============================
-    base_dir = "results"
-    csv_dir = os.path.join(base_dir, "csv")
-    png_dir = os.path.join(base_dir, "png")
+    state_init_s = torch.cat((fix_cov_past_s, laser_past_s, mp_temp_past_s), dim=2)
 
-    os.makedirs(csv_dir, exist_ok=True)
-    os.makedirs(png_dir, exist_ok=True)
+    # 미래 Planning 데이터 (Reference & Constraints)
+    mp_temp_ref = GAMMA_obj.ref[GAMMA_obj.MPC_counter:GAMMA_obj.MPC_counter + P]
+    mp_temp_ref_t = torch.as_tensor(mp_temp_ref, dtype=torch.float32, device=device).reshape(1, P, 1)
+    
+    fix_cov_future = GAMMA_obj.fix_cov_all[GAMMA_obj.MPC_counter:GAMMA_obj.MPC_counter + P, :]
+    fix_cov_future_t = torch.as_tensor(fix_cov_future, dtype=torch.float32, device=device).unsqueeze(0)
 
-    env = mbd.envs.get_env(args.env_name, device=args.device)
+    planning_data = {
+        'ref': normalize_y(mp_temp_ref_t, dim_id=[0])[:, :, 0].unsqueeze(-1),
+        'con': torch.tensor([[0.1423, 0.4126]] * P, device=device).reshape(1, P, 2), # 노트북 상수
+        'fix_cov_future': normalize_x(fix_cov_future_t, dim_id=[0, 1, 2])
+    }
 
-    x1_diff, x2_diff, u_diff = 9.32425809, 14.13760952, 9.99280029
+    # Diffusion Process (Warm Start 적용)
+    betas = torch.linspace(mbd_args.beta0, mbd_args.betaT, mbd_args.Ndiffuse, device=device)
+    alphas = 1.0 - betas; alphas_bar = torch.cumprod(alphas, dim=0); sigmas = torch.sqrt(1 - alphas_bar)
 
-    # ===============================
-    # Reference trajectory 생성
-    # ===============================
-    scaling = 2
-    Ref_traj_step = torch.tensor(np.repeat(np.array([0, -scaling, -scaling, 0, scaling, scaling]), 30))
+    if not hasattr(GAMMA_obj, 'u_refine_prev'):
+        Yi = torch.zeros([P, env.action_size], device=device)
+    else:
+        # Receding Horizon Warm Start
+        Yi = torch.cat([GAMMA_obj.u_refine_prev[1:], GAMMA_obj.u_refine_prev[-1:]], dim=0)
 
-    def sigmoid(x):
-        return 1 / (1 + np.exp(-x / 4))
+    for i in range(mbd_args.Ndiffuse - 1, -1, -1):
+        # mbd_planner.py의 reverse_once 호출
+        Yi = reverse_once(i, Yi, state_init_s, planning_data, env, mbd_args, alphas, alphas_bar, sigmas)
 
-    x = np.linspace(0, 50, 50)
-    y = -sigmoid(x - 25) * scaling + scaling
-    Ref_traj_sigmoid = torch.tensor(y)
+    GAMMA_obj.u_refine_prev = Yi.clone()
+    u_applied = float(inverse_normalize_x(Yi[0, 0].unsqueeze(0), dim_id=[3]))
 
-    x_sin = np.linspace(0, 2 * np.pi, 100)
-    y_sin = scaling * np.sin(x_sin)
-    Ref_traj_sin = torch.tensor(y_sin)
+    # 시뮬레이션 물리 업데이트 및 저장 (노트북 Cell 6 후반부)
+    x_current, depth_current = GAMMA_obj.run_sim_interval(u_applied)
 
-    Ref_traj = torch.cat((
-        Ref_traj_step,
-        Ref_traj_sigmoid,
-        torch.zeros(20),
-        Ref_traj_sin,
-        Ref_traj_step,
-        torch.zeros(20)
-    ))
+    GAMMA_obj.x_past[:, :-1] = GAMMA_obj.x_past[:, 1:]
+    GAMMA_obj.x_past[0, -1] = x_current
+    GAMMA_obj.x_past[1, -1] = depth_current
+    GAMMA_obj.u_past[:-1] = GAMMA_obj.u_past[1:].clone()
+    GAMMA_obj.u_past[-1] = u_applied
+    GAMMA_obj.MPC_counter += 1
 
-    tot_step = len(Ref_traj)
+    # 시각화 데이터 기록
+    new_state = torch.tensor([[x_current, depth_current]], device=GAMMA_obj.x_past_save.device)
+    GAMMA_obj.x_past_save = torch.cat((GAMMA_obj.x_past_save, new_state), dim=0)
+    new_u = torch.tensor([[u_applied]], device=GAMMA_obj.u_past_save.device)
+    GAMMA_obj.u_past_save = torch.cat((GAMMA_obj.u_past_save, new_u), dim=0)
 
-    x_constraint = np.linspace(0, tot_step, tot_step)
-    C_Ref_traj_up = torch.tensor(4 + 0.5 * np.sin(2 * np.pi * x_constraint / 100) - 0.004 * x_constraint)
-    C_Ref_traj_low = -C_Ref_traj_up
+    return u_applied
 
-    window = 10
-
-    sliding_data_ref_x1 = Ref_traj.unfold(0, window, 1)
-    sliding_data_con_x2_low = C_Ref_traj_low.unfold(0, window, 1)
-    sliding_data_con_x2_up = C_Ref_traj_up.unfold(0, window, 1)
-
-    num_sim_steps = 530
-    x_trajectory = torch.zeros((num_sim_steps + window + 1, 2), device=device).float()
-    u_trajectory = torch.zeros((num_sim_steps + window + 1, 1), device=device).float()
-
-    # ===============================
-    # Diffusion Scheduling
-    # ===============================
-    betas = torch.linspace(args.beta0, args.betaT, args.Ndiffuse, device=device)
-    alphas = 1.0 - betas
-    alphas_bar = torch.cumprod(alphas, dim=0)
-    sigmas = torch.sqrt(1 - alphas_bar)
-
-    # ===============================
-    # 시간 측정 시작
-    # ===============================
-    start_time = time.time()
-
-    # ===============================
-    # MPC Loop
-    # ===============================
-    for i in tqdm(range(num_sim_steps), desc=f"MPC ({tag})"):
-
-        curr_x_win = x_trajectory[i: i + window]
-        curr_u_win = u_trajectory[i: i + window]
-        state_init = torch.cat([curr_x_win, curr_u_win], dim=-1).unsqueeze(0)
-
-        planning_data = {
-            'x1_ref': sliding_data_ref_x1[i + window].to(device) / (x1_diff / 2),
-            'x2_low': sliding_data_con_x2_low[i + window].to(device) / (x2_diff / 2),
-            'x2_up': sliding_data_con_x2_up[i + window].to(device) / (x2_diff / 2),
-        }
-
-        Yi = torch.zeros([args.Hsample, env.action_size], device=device)
-
-        for d in range(args.Ndiffuse - 1, -1, -1):
-            Yi, _ = reverse_once(
-                d,
-                args.seed,
-                Yi,
-                state_init,
-                planning_data,
-                env,
-                args,
-                alphas,
-                alphas_bar,
-                sigmas
-            )
-
-        u_next_norm = Yi[0]
-        u_trajectory[i + window] = u_next_norm
-
-        u_real = (u_next_norm * (u_diff / 2)).cpu().numpy().reshape(1, 1)
-        x_real = (x_trajectory[i + window] *
-                  torch.tensor([x1_diff / 2, x2_diff / 2], device=device)
-                  ).cpu().numpy().reshape(2, 1)
-
-        x_next_real = f_ss(x_real, u_real)
-
-        x_next_norm = torch.tensor(x_next_real, device=device).float().squeeze()
-        x_next_norm[0] /= (x1_diff / 2)
-        x_next_norm[1] /= (x2_diff / 2)
-
-        x_trajectory[i + window + 1] = x_next_norm
-
-    # ===============================
-    # 시간 계산
-    # ===============================
-    end_time = time.time()
-    total_time = end_time - start_time
-    time_per_step = total_time / num_sim_steps
-
-    print(f"\n[{tag}] Total Time: {total_time:.3f} sec")
-    print(f"[{tag}] Avg Time per Step: {time_per_step:.6f} sec")
-
-    # ===============================
-    # 결과 시각화 저장
-    # ===============================
-    plt.figure(figsize=(12, 6))
-    x_plot = x_trajectory.cpu().numpy()
-
-    plt.plot(x_plot[:, 0] * (x1_diff / 2), label="x1 (State)")
-    plt.plot(Ref_traj.numpy(), linestyle=':', label="x1 (Reference)")
-    plt.plot(x_plot[:, 1] * (x2_diff / 2), label="x2 (State)")
-    plt.plot(C_Ref_traj_up.numpy(), 'k--', alpha=0.3)
-    plt.plot(C_Ref_traj_low.numpy(), 'k--', alpha=0.3)
-
-    plt.legend()
-    plt.title(f"MPC-Diffusion ({tag})")
-    plt.savefig(os.path.join(png_dir, f"mpc_diffusion_result_lambda0.1_{tag}.png"))
-    plt.close()
-
-    # ===============================
-    # CSV 저장
-    # ===============================
-    u_plot = u_trajectory.cpu().numpy()
-
-    df = pd.DataFrame({
-        "time_index": np.arange(len(x_plot)),
-        "x1_state": x_plot[:, 0] * (x1_diff / 2),
-        "x2_state": x_plot[:, 1] * (x2_diff / 2),
-        "u_input": u_plot[:, 0] * (u_diff / 2),
-        "elapsed_total_sec": total_time,
-        "elapsed_per_step_sec": time_per_step
-    })
-
-    df.to_csv(os.path.join(csv_dir, f"mpc_diffusion_result_lambda0.1_{tag}.csv"), index=False)
-
-# ===============================
-# 3. DOE 실행 함수
-# ===============================
-def run_doe():
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    print("\n===== DOE 1: Nsample =====")
-    for ns in [1024, 2048, 4096]:
-        args = Args(
-            env_name="tide_env",
-            Hsample=10,
-            Nsample=ns,
-            Ndiffuse=50,
-            temp_sample=0.1,
-            seed=42,
-            device=device
-        )
-        run_mpc(args, tag=f"Nsample_{ns}")
-
-    print("\n===== DOE 2: Ndiffuse =====")
-    for nd in [10, 50, 100]:
-        args = Args(
-            env_name="tide_env",
-            Hsample=10,
-            Nsample=2048,
-            Ndiffuse=nd,
-            temp_sample=0.1,
-            seed=42,
-            device=device
-        )
-        run_mpc(args, tag=f"Ndiffuse_{nd}")
-
-
-# ===============================
-# 4. Main
-# ===============================
+# ==========================================
+# 4. Main 실행부 (노트북 Step 11 로직과 100% 동일화)
+# ==========================================
 if __name__ == "__main__":
-    run_doe()
+    # 노트북과 동일한 디바이스 설정
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    mbd_args = Args(Nsample=1024, Ndiffuse=200, temp_sample=0.1, device=str(device))
+    
+    # ── 노트북 상수 설정 (Cell 11에서 복사) ──────────────────────
+    INPUT_DATA_DIR = "data"
+    SIM_DIR_NAME = "single_track_square"
+    BASE_LASER_FILE_DIR = "laser_power_profiles/csv"
+    CLOUD_TARGET_BASE_PATH = "result"
+    solidus_temp = 1600 # 노트북 기준
+    window = 50
+    sim_interval = 5
+    init_runs = 50
+    P = 50
+
+    # TiDE 환경 로드
+    weight_path = "TiDE_params_single_track_square_MV_temp_depth_less_cov_0915_w50_p50.pkl"
+    env = mbd.envs.get_env("tide_env", weight_path, device=str(device))
+
+    # 결과 저장 경로
+    save_dir = "./results/plots"
+    os.makedirs(save_dir, exist_ok=True)
+
+    # ── 루프 시작 (노트북 range(1, 15) 반영) ───────────────────────────
+    for laser_num in range(1, 15):
+        try:
+            # Step 1: 노트북에 명시된 CSV 경로 (절대 경로)
+            csv_path = f"/home/ftk3187/github/DPC_research/02_DED/4_policy_0725/split_by_laser_power_number/laser_power_number_{laser_num}.csv"
+            df = pd.read_csv(csv_path)
+
+            # [수정] 컬럼명 오류 방지: 대소문자 확인 (노트북은 'Laser_power' 사용)
+            if 'Laser_power' not in df.columns and 'laser_power' in df.columns:
+                df.rename(columns={'laser_power': 'Laser_power'}, inplace=True)
+
+            # Step 2: GAMMA 객체 생성
+            GAMMA_class = GAMMA_obj(INPUT_DATA_DIR, SIM_DIR_NAME, BASE_LASER_FILE_DIR,
+                                    CLOUD_TARGET_BASE_PATH, solidus_temp, window,
+                                    init_runs, sim_interval, laser_power_number=laser_num)
+
+            # Step 3: 초기 스텝 실행 (노트북 로직)
+            init_avg = GAMMA_class.run_initial_steps()
+            init_avg = torch.tensor(init_avg, dtype=torch.float32).to(device)[:, -window:]
+
+            # Step 4: 공변량 및 참조 궤적 처리 (노트북 Step 4 복사)
+            loc_Z = df["Z"].to_numpy().reshape(-1, 1)
+            dist_X = df["Dist_to_nearest_X"].to_numpy().reshape(-1, 1)
+            dist_Y = df["Dist_to_nearest_Y"].to_numpy().reshape(-1, 1)
+            fix_covariates = torch.tensor(np.concatenate((loc_Z, dist_X, dist_Y), axis=1), dtype=torch.float32).to(device)
+
+            laser_power_ref = torch.tensor(df["Laser_power"].to_numpy().reshape(-1, 1), dtype=torch.float32).to(device)
+            laser_power_past = laser_power_ref[:window]
+
+            mp_temp_raw = df["melt_pool_temperature"].to_numpy()
+            mp_temp = copy.deepcopy(mp_temp_raw)
+            mp_temp[1:-2] = moving_average_1d(mp_temp_raw, 4)
+            mp_temp_ref = torch.tensor(mp_temp, dtype=torch.float32).to(device)
+
+            # Step 5: GAMMA_class 변수 주입 (노트북 Step 5 복사)
+            GAMMA_class.ref = mp_temp_ref.clone()
+            GAMMA_class.fix_cov_all = fix_covariates.clone()
+            GAMMA_class.x_past = init_avg.clone()   # 노트북 명칭 확인: x_past
+            GAMMA_class.u_past = laser_power_past.clone()
+            GAMMA_class.x_past_save = GAMMA_class.x_past.T.clone()
+            GAMMA_class.u_past_save = GAMMA_class.u_past.clone()
+            GAMMA_class.MPC_counter = window
+            
+            # x_hat_current 등 추가 상태 초기화 (노트북 로직)
+            GAMMA_class.x_hat_current = GAMMA_class.x_past[:, -1]
+            GAMMA_class.x_sys_current = GAMMA_class.x_past[:, -1].reshape(2, 1)
+
+            # Step 6: 시뮬레이션 루프
+            N_step = len(mp_temp_ref) - P
+            
+            # 중간 플롯을 저장할 디렉토리 생성
+            laser_plot_dir = os.path.join(save_dir, f"laser_{laser_num}")
+            os.makedirs(laser_plot_dir, exist_ok=True)
+
+            # i 루프 범위 노트북과 동일화 (N_step - P)
+            for i in tqdm(range(N_step - P), desc=f"Laser {laser_num} (MBD)"):
+                # MBD 기반 제어 1스텝 실행
+                run_one_step_diffusion(GAMMA_class, env, mbd_args, P, window)
+                
+                # 100개 timestep마다 플롯 저장
+                current_step = i + 1
+                if current_step % 100 == 0:
+                    mid_plot_path = os.path.join(laser_plot_dir, f"step_{current_step}.png")
+                    # plot_fig(객체, 현재까지 진행된 길이, 저장경로)
+                    plot_fig(GAMMA_class, GAMMA_class.MPC_counter, save_path=mid_plot_path)
+
+            # 최종 플롯 저장
+            final_plot_path = os.path.join(save_dir, f"final_plot_laser_{laser_num}.png")
+            plot_fig(GAMMA_class, GAMMA_class.MPC_counter, save_path=final_plot_path)
+
+            print(f"✅ Completed laser_power_number {laser_num}")
+
+        except Exception as e:
+            print(f"❌ Error in laser_power_number {laser_num}: {e}")
+            import traceback
+            traceback.print_exc()
